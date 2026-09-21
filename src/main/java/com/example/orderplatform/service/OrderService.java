@@ -1,0 +1,174 @@
+
+package com.example.orderplatform.service;
+
+import com.example.orderplatform.event.OrderCreatedEvent;
+import com.example.orderplatform.exception.CustomerNotFoundException;
+import com.example.orderplatform.exception.OrderNotFoundException;
+import com.example.orderplatform.messaging.publisher.OrderEventPublisher;
+import com.example.orderplatform.model.Order;
+import com.example.orderplatform.repository.OrderRepository;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Business logic for orders.
+ * <p>
+ * {@link #findById(String)} uses the cache-aside pattern (Redis in front of
+ * Azure SQL); mutations keep the cache consistent via {@code @CachePut} /
+ * {@code @CacheEvict}.
+ */
+@Service
+public class OrderService {
+
+    public static final String ORDERS_CACHE = "orders";
+
+    private final OrderRepository orderRepository;
+    private final OrderEventPublisher orderEventPublisher;
+    private final CustomerService customerService;
+
+    public OrderService(OrderRepository orderRepository,
+                        OrderEventPublisher orderEventPublisher,
+                        CustomerService customerService) {
+        this.orderRepository = orderRepository;
+        this.orderEventPublisher = orderEventPublisher;
+        this.customerService = customerService;
+    }
+
+    @Transactional
+    public Order create(Order order) {
+        // Referential integrity: an order must reference an existing customer.
+        if (order.getCustomerId() == null || order.getCustomerId().isBlank()) {
+            throw new CustomerNotFoundException("(missing)");
+        }
+        customerService.findById(order.getCustomerId());
+
+        if (order.getOrderId() == null || order.getOrderId().isBlank()) {
+            order.setOrderId(UUID.randomUUID().toString());
+        }
+        if (order.getCreatedAt() == null) {
+            order.setCreatedAt(Instant.now());
+        }
+        if (order.getStatus() == null || order.getStatus().isBlank()) {
+            order.setStatus("CREATED");
+        }
+        order.setTotalAmount(computeTotal(order));
+        orderRepository.save(order);
+
+        // Fan-out: publish the creation event to Service Bus (best-effort).
+        orderEventPublisher.publish(new OrderCreatedEvent(
+                order.getOrderId(),
+                order.getCustomerId(),
+                order.getStatus(),
+                order.getTotalAmount(),
+                order.getCreatedAt()));
+
+        return order;
+    }
+
+    /**
+     * Cache-aside read: check Redis first; on a miss, load from SQL and
+     * populate the cache for subsequent lookups.
+     * <p>
+     * Runs in a read-only transaction and returns a fully-detached entity whose
+     * {@code items} collection is a plain {@link ArrayList} (not a Hibernate
+     * {@code PersistentBag}), so it can be safely serialized into Redis.
+     */
+    @Cacheable(cacheNames = ORDERS_CACHE, key = "#orderId")
+    @Transactional(readOnly = true)
+    public Order findById(String orderId) {
+        Order order = orderRepository.findByOrderId(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        return detach(order);
+    }
+
+    public List<Order> findAll() {
+        return orderRepository.findAll();
+    }
+
+    @CachePut(cacheNames = ORDERS_CACHE, key = "#orderId")
+    @Transactional
+    public Order update(String orderId, Order updated) {
+        Order existing = orderRepository.findByOrderId(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        // customerId is immutable after creation: reject any attempt to change it.
+        if (updated.getCustomerId() != null && !updated.getCustomerId().equals(existing.getCustomerId())) {
+            throw new IllegalArgumentException("customerId is immutable and cannot be changed");
+        }
+        existing.setStatus(updated.getStatus() != null ? updated.getStatus() : existing.getStatus());
+        if (updated.getItems() != null) {
+            // Mutate the collection in place (rather than replacing the reference)
+            // to satisfy Hibernate's all-delete-orphan cascade.
+            if (existing.getItems() == null) {
+                existing.setItems(new ArrayList<>());
+            }
+            existing.getItems().clear();
+            existing.getItems().addAll(updated.getItems());
+            existing.setTotalAmount(computeTotal(existing));
+        }
+        orderRepository.save(existing);
+        return detach(existing);
+    }
+
+    /**
+     * Updates only the status of an order and refreshes its cache entry. Used by
+     * the async consumers (OrderProcessor / Lambda handler) so a status change is
+     * immediately visible through the cache.
+     */
+    @CachePut(cacheNames = ORDERS_CACHE, key = "#orderId")
+    @Transactional
+    public Order updateStatus(String orderId, String status) {
+        Order existing = orderRepository.findByOrderId(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        existing.setStatus(status);
+        orderRepository.save(existing);
+        return detach(existing);
+    }
+
+    @CacheEvict(cacheNames = ORDERS_CACHE, key = "#orderId")
+    @Transactional
+    public void delete(String orderId) {
+        findById(orderId);
+        orderRepository.deleteByOrderId(orderId);
+    }
+
+    private BigDecimal computeTotal(Order order) {
+        if (order.getItems() == null) {
+            return BigDecimal.ZERO;
+        }
+        return order.getItems().stream()
+                .map(item -> {
+                    BigDecimal price = item.getUnitPrice() == null ? BigDecimal.ZERO : item.getUnitPrice();
+                    BigDecimal qty = item.getQuantity() == null ? BigDecimal.ZERO : BigDecimal.valueOf(item.getQuantity());
+                    return price.multiply(qty);
+                })
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    /**
+     * Returns a detached copy of the order whose {@code items} collection is a
+     * plain {@link ArrayList}. This avoids serializing Hibernate's
+     * {@code PersistentBag} (and its type metadata) into Redis, which cannot be
+     * rehydrated outside a session.
+     */
+    private Order detach(Order source) {
+        Order copy = new Order();
+        copy.setOrderId(source.getOrderId());
+        copy.setCustomerId(source.getCustomerId());
+        copy.setStatus(source.getStatus());
+        copy.setTotalAmount(source.getTotalAmount());
+        copy.setCreatedAt(source.getCreatedAt());
+        if (source.getItems() != null) {
+            copy.setItems(new ArrayList<>(source.getItems()));
+        }
+        return copy;
+    }
+}

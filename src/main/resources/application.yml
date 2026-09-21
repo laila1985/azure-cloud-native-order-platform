@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-platform
+
+  # --- Database -------------------------------------------------------------
+  # Default datasource is H2 (in-memory) so `./gradlew bootRun` works with no
+  # Docker dependency. For Azure SQL, run with `-Dspring.profiles.active=azure`
+  # (see application-azure.yml) or override the datasource properties directly.
+  datasource:
+    url: jdbc:h2:mem:orderplatform;DB_CLOSE_DELAY=-1;MODE=MSSQLServer
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
+  # --- Redis cache (Azure Cache for Redis in production) --------------------
+  cache:
+    type: redis
+    redis:
+      time-to-live: PT5M
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+azure:
+  servicebus:
+    # Connection string to the Service Bus namespace (or the local emulator).
+    connection-string: ${SERVICEBUS_CONNECTION_STRING:Endpoint=sb://localhost;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;}
+    topic-name: order-events
+    processor-subscription: order-processor
+    lambda-subscription: order-lambda
+    email-subscription: order-email
+    sms-subscription: order-sms
+    shipping-subscription: order-shipping
+    poll-interval-ms: 5000
+  communication:
+    # Azure Communication Services connection string (leave blank for local dev;
+    # email/SMS steps then no-op and simply log).
+    connection-string: ${ACS_CONNECTION_STRING:}
+    sender-email: ${ACS_SENDER_EMAIL:no-reply@example.com}
+    from-phone-number: ${ACS_FROM_PHONE:+15550000000}
+  currency: AED

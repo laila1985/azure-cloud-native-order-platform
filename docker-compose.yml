@@ -1,0 +1,100 @@
+services:
+  # Azure SQL Edge (SQL Server compatible) — backing store for the emulator and
+  # the application's Azure SQL database (via the `azure` profile).
+  mssql:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: azure-sql-edge
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD:-YourStrong!Passw0rd}
+      - MSSQL_PID=Developer
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: [ "CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -C || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Azure Service Bus emulator (topic + subscriptions) for local development.
+  # The topic `order-events` and its five subscriptions are pre-provisioned from
+  # servicebus/Config.json, so no management calls are needed at runtime.
+  servicebus-emulator:
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    container_name: servicebus-emulator
+    volumes:
+      - "./servicebus/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json"
+    environment:
+      - ACCEPT_EULA=Y
+      - SQL_SERVER=mssql
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD:-YourStrong!Passw0rd}
+      - EMULATOR_HTTP_PORT=5300
+      - SQL_WAIT_INTERVAL=20
+    ports:
+      - "5672:5672"   # AMQP
+      - "5300:5300"   # management / health-check API
+    depends_on:
+      mssql:
+        condition: service_healthy
+
+  # One-shot init job: creates the application database once SQL Edge is ready.
+  mssql-init:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: azure-sql-init
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD:-YourStrong!Passw0rd}
+    volumes:
+      - "./mssql/init:/init:ro"
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          /opt/mssql-tools/bin/sqlcmd -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1 && break
+          echo "Waiting for SQL Server..."; sleep 2
+        done
+        for f in /init/*.sql; do
+          echo "Running $$f"
+          /opt/mssql-tools/bin/sqlcmd -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -i "$$f"
+        done
+    depends_on:
+      mssql:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    # Unique name: the AWS sibling project also uses `container_name: redis`,
+    # and Docker names must be unique host-wide.
+    container_name: order-platform-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # The Spring Boot application (built from the local Dockerfile).
+  app:
+    build: .
+    container_name: order-platform-app
+    environment:
+      - SPRING_PROFILES_ACTIVE=azure
+      - AZURE_SQL_URL=jdbc:sqlserver://mssql:1433;databaseName=orderplatform;encrypt=true;trustServerCertificate=true
+      - AZURE_SQL_USER=sa
+      - AZURE_SQL_PASSWORD=${MSSQL_SA_PASSWORD:-YourStrong!Passw0rd}
+      # Cross-container: reach the emulator via its service alias over AMQP (5672).
+      - SERVICEBUS_CONNECTION_STRING=Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;
+      - SPRING_DATA_REDIS_HOST=redis
+    ports:
+      - "8080:8080"
+    depends_on:
+      mssql:
+        condition: service_healthy
+      mssql-init:
+        condition: service_completed_successfully
+      servicebus-emulator:
+        condition: service_started
+      redis:
+        condition: service_healthy

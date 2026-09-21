@@ -1,0 +1,11 @@
+# Azure production / Azure SQL Edge profile.
+# Activate with: ./gradlew bootRun --args='--spring.profiles.active=azure'
+# or set SPRING_PROFILES_ACTIVE=azure.
+spring:
+  datasource:
+    url: ${AZURE_SQL_URL:jdbc:sqlserver://localhost:1433;databaseName=orderplatform;encrypt=true;trustServerCertificate=true}
+    username: ${AZURE_SQL_USER:sa}
+    password: ${AZURE_SQL_PASSWORD:YourStrong!Passw0rd}
+  jpa:
+    hibernate:
+      ddl-auto: update
